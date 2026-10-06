@@ -35,8 +35,6 @@
  * Store whatever you feel is necessary for your implementation.
  */
 
-
-
 /*
  * Supplied output API examples
  * ----------------------------
@@ -105,22 +103,21 @@ PCB *initialize_PCB(ProcessSpec spec)
     process->state = STATE_NEW;
     return process;
 }
-void initialize_simulation(Simulation *simulation,SimulationConfig config)
+void initialize_simulation(Simulation *simulation, SimulationConfig config)
 {
     simulation->clock = 0;
     simulation->currently_proccessing = NULL;
     simulation->IO_queue = NULL;
     simulation->Ready_queue = NULL;
     simulation->waiting_queue = NULL;
-    simulation->rolling_quatum_count=config.quantum;
+    simulation->rolling_quatum_count = config.quantum;
 }
-void load_all_processes(const ProcessSpec *specs,size_t count,Simulation *simulation){
-    for(size_t i=0;i<count;i++){
-        add_new_queue(&(simulation->waiting_queue),specs[i]);
-        
+void load_all_processes(const ProcessSpec *specs, size_t count, Simulation *simulation)
+{
+    for (size_t i = 0; i < count; i++)
+    {
+        add_new_queue(&(simulation->waiting_queue), specs[i]);
     }
-   
-
 }
 
 /*
@@ -162,18 +159,123 @@ bool run_simulation(const ProcessSpec *specs,
     (void)output;
     Simulation simulation;
     initialize_simulation(&simulation, *config);
-    load_all_processes(specs,count,&simulation);
-        while(simulation.currently_proccessing !=NULL ||
-            simulation.IO_queue != NULL ||
-            simulation.Ready_queue != NULL ||
-            simulation.waiting_queue != NULL ){
-            load_waiting_into_ready_queue(&simulation,simulation.clock);
-            select_next_process(&simulation, *config);
-            decrement_queue_times(&simulation, *config);
-            print_values_in_the_queue(&(simulation.currently_proccessing));
-            //printf("This queue is empty");
-            simulation.clock++;
-          }
+    bool is_dispatch = false;
+    bool first_tick = true;
+    int context_remaining = 0;
+    TransitionReason prev_cpu_reason;
+    bool is_prev_cpu_reason = false;
+    int PID_tracker = -1;
+    ProcessState pending_new_state;
+    load_all_processes(specs, count, &simulation);
 
-    return false;
+    while (simulation.currently_proccessing != NULL ||
+           simulation.IO_queue != NULL ||
+           simulation.Ready_queue != NULL ||
+           simulation.waiting_queue != NULL)
+    {
+        if (!first_tick)
+        {
+            /*
+             * This should:
+             * - decrement/resolve previous CPU execution if CPU ran
+             * - detect CPU burst completion
+             * - detect RR quantum expiration
+             * - progress/complete I/O
+             *
+             * You may need a small change to decrement_queue_times()
+             * so it knows whether the previous interval was CPU,
+             * context switch, or idle.
+             */
+
+            decrement_queue_times(&simulation, *config, is_dispatch, output, &prev_cpu_reason, &PID_tracker, &is_prev_cpu_reason, &pending_new_state);
+            if (is_prev_cpu_reason == true && is_dispatch == false)
+            {
+                if (prev_cpu_reason == REASON_PROCESS_COMPLETE)
+                    log_transition(output, simulation.clock, PID_tracker, STATE_RUNNING, pending_new_state, REASON_PROCESS_COMPLETE);
+                else if (prev_cpu_reason == REASON_CPU_BURST_COMPLETE)
+                    log_transition(output, simulation.clock, PID_tracker, STATE_RUNNING, pending_new_state, REASON_CPU_BURST_COMPLETE);
+                else if (prev_cpu_reason == REASON_QUANTUM_EXPIRED)
+                    log_transition(output, simulation.clock, PID_tracker, STATE_RUNNING, pending_new_state, REASON_QUANTUM_EXPIRED);
+                is_prev_cpu_reason = false;
+            }
+            complete_IO( &simulation,output);
+        }
+        first_tick = false;
+        load_waiting_into_ready_queue(&simulation, simulation.clock, output);
+
+        if (!is_dispatch &&
+            config->algorithm == ALG_SRTF &&
+            simulation.currently_proccessing != NULL)
+        {
+            /*
+             * Your select_next_process() may need a slight change so
+             * that this call only performs SRTF preemption here.
+             */
+            select_next_process(&simulation, *config, output);
+        }
+
+        if (!is_dispatch && simulation.currently_proccessing == NULL && simulation.Ready_queue != NULL)
+        {
+            is_dispatch = true;
+            context_remaining = config->context_switch;
+        }
+
+        if (is_dispatch && context_remaining > 0)
+        {
+             decrement_IO_times(&simulation);
+            record_timeline_tick(output, simulation.clock, ACTIVITY_CONTEXT_SWITCH, 0);
+
+            context_remaining--;
+
+            /*
+             * Advance exactly one interval.
+             */
+            simulation.clock++;
+
+            continue;
+        }
+
+        if (is_dispatch && context_remaining == 0)
+        {
+            is_dispatch = false;
+
+            bool selected = select_next_process(&simulation, *config, output);
+
+            if (selected && simulation.currently_proccessing != NULL)
+            {
+                log_transition(output, simulation.clock, simulation.currently_proccessing->PCB->starting_spec.pid, STATE_READY, STATE_RUNNING, REASON_DISPATCH);
+
+                /*
+                 * RR process gets a fresh quantum when dispatched.
+                 */
+                if (config->algorithm == ALG_RR)
+                {
+                    simulation.rolling_quatum_count =
+                        config->quantum;
+                }
+            }
+        }
+        decrement_IO_times(&simulation);
+        if (simulation.currently_proccessing == NULL &&
+            simulation.Ready_queue == NULL &&
+            simulation.IO_queue == NULL &&
+            simulation.waiting_queue == NULL &&
+            !is_dispatch)
+        {
+            break;
+        }
+        if (simulation.currently_proccessing != NULL)
+        {
+            record_timeline_tick(output, simulation.clock, ACTIVITY_CPU, simulation.currently_proccessing->PCB->starting_spec.pid);
+        }
+        else
+        {
+            record_timeline_tick(output, simulation.clock, ACTIVITY_IDLE, 0);
+        }
+        simulation.clock++;
+    }
+    if (!write_metrics(output, specs, count))
+        return false;
+
+    return true;
 }

@@ -15,7 +15,7 @@ import sys
 import tempfile
 
 OUTPUT_FILES = ("transitions.csv", "timeline.csv", "metrics.csv", "summary.csv")
-MAX_CAPTURED_LINES = 100
+MAX_CAPTURED_LINES = 100000
 
 FILE_HINTS = {
     "transitions.csv": (
